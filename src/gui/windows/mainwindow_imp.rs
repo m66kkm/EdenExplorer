@@ -2,8 +2,8 @@ use crate::core::drives::{get_drive_infos, is_raw_physical_drive_path};
 use crate::core::fs::{FileItem, get_shell_item_metadata};
 use crate::core::fs::{MY_RECYCLE_BIN_PATH, parallel_directory_scan, scan_dir_async};
 use crate::core::indexer::{
-    DirectorySettingsSnapshot, load_app_settings, save_app_settings, save_favorites, save_tags,
-    save_theme_settings,
+    DirectorySettingsSnapshot, WindowSizeMode, load_app_settings, save_app_settings,
+    save_favorites, save_tags, save_theme_settings,
 };
 use crate::gui::MainWindow;
 use crate::gui::i18n::I18n;
@@ -11,9 +11,9 @@ use crate::gui::theme::{
     ThemeMode, ThemePalette, apply_font_to_context, get_default_palette, set_palette,
 };
 use crate::gui::utils::{
-    ClipboardFileRead, SortColumn, SortKey, clear_clipboard_files, is_clipboard_cut,
-    read_clipboard_files, set_clipboard_files, shell_delete_to_recycle_bin, show_copy_move_dialog,
-    sort_files_by_keys,
+    ClipboardFileRead, SortColumn, SortKey, delete_paths_native, directory_child_paths,
+    is_clipboard_cut, read_clipboard_files, restore_paths_native, selection_paths_after_paste,
+    set_clipboard_files, show_copy_move_dialog, sort_files_by_keys,
 };
 use crate::gui::windows::about::draw_about_window;
 use crate::gui::windows::containers::enums::{
@@ -35,21 +35,18 @@ use crate::gui::windows::windowsoverrides::toggle_window_fullscreen;
 use crossbeam_channel::Receiver;
 use crossbeam_channel::{Sender, unbounded};
 use eframe::egui;
-use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     IShellItem, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, ShellExecuteExW, ShellExecuteW,
 };
-use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Error, HRESULT};
-
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, SW_SHOW, SW_SHOWNORMAL, WM_CLOSE};
 use windows::{Win32::System::Com::*, Win32::UI::Shell::*, core::*};
 
 pub(crate) fn default_column_state(settings: &AppSettings) -> ItemViewerColumnState {
@@ -902,7 +899,7 @@ impl MainWindow {
                         .collect()
                 };
 
-                if let Err(e) = self.restore_paths_native(recycle_bin_pidls) {
+                if let Err(e) = restore_paths_native(recycle_bin_pidls) {
                     eprintln!("Recycle bin restore failed: {:?}", e);
                 }
 
@@ -989,13 +986,10 @@ impl MainWindow {
             }
             ItemViewerContextAction::Delete(paths) => {
                 let allow_undo = !self.current_nav().is_recycle_bin();
-                if let Err(e) = self.delete_paths_native(paths.clone(), allow_undo) {
-                    eprintln!("Native delete failed: {:?}", e);
 
-                    // fallback (rare, but safe)
-                    for path in &paths {
-                        self.delete_path(path);
-                    }
+                if let Err(e) = delete_paths_native(paths.clone(), allow_undo) {
+                    eprintln!("Native delete failed: {:?}", e);
+                    return;
                 }
 
                 let mut tags_changed = false;
@@ -1033,7 +1027,7 @@ impl MainWindow {
 
         let is_cut = is_clipboard_cut();
         let target_dir = self.current_nav().current.clone();
-        let before_entries = Self::directory_child_paths(&target_dir);
+        let before_entries = directory_child_paths(&target_dir);
 
         unsafe {
             let file_op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
@@ -1068,7 +1062,7 @@ impl MainWindow {
             self.persist_tags();
         }
 
-        let pasted_paths = Self::selection_paths_after_paste(&target_dir, &before_entries, &paths);
+        let pasted_paths = selection_paths_after_paste(&target_dir, &before_entries, &paths);
         if !pasted_paths.is_empty() {
             let side = self.focused_split;
             self.active_tab_mut()
@@ -1078,126 +1072,6 @@ impl MainWindow {
         }
 
         self.load_path();
-        Ok(())
-    }
-
-    fn directory_child_paths(dir: &Path) -> HashSet<PathBuf> {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn selection_paths_after_paste(
-        target_dir: &Path,
-        before_entries: &HashSet<PathBuf>,
-        sources: &[PathBuf],
-    ) -> Vec<PathBuf> {
-        let mut pasted_paths: Vec<PathBuf> = Self::directory_child_paths(target_dir)
-            .difference(before_entries)
-            .cloned()
-            .collect();
-
-        if pasted_paths.is_empty() {
-            for source in sources {
-                if let Some(name) = source.file_name() {
-                    let candidate = target_dir.join(name);
-                    if candidate.exists() {
-                        pasted_paths.push(candidate);
-                    }
-                }
-            }
-        }
-
-        pasted_paths
-    }
-
-    pub fn delete_path(&self, path: &PathBuf) {
-        if !shell_delete_to_recycle_bin(path) {
-            if path.is_dir() {
-                let _ = std::fs::remove_dir_all(path);
-            } else {
-                let _ = std::fs::remove_file(path);
-            }
-        }
-    }
-
-    pub fn delete_paths_native(
-        &self,
-        paths: Vec<PathBuf>,
-        allow_undo: bool,
-    ) -> windows::core::Result<()> {
-        use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
-        use windows::Win32::UI::Shell::{
-            FOF_ALLOWUNDO, FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName,
-        };
-        use windows::core::HSTRING;
-
-        unsafe {
-            let file_op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
-
-            // Recycle-bin view needs permanent delete; normal view keeps undo.
-            let flags = if allow_undo {
-                FOF_ALLOWUNDO | FOF_WANTNUKEWARNING
-            } else {
-                FOF_WANTNUKEWARNING
-            };
-            file_op.SetOperationFlags(flags)?;
-
-            for path in paths {
-                let item: IShellItem = SHCreateItemFromParsingName(
-                    &HSTRING::from(path.to_string_lossy().to_string()),
-                    None,
-                )?;
-
-                file_op.DeleteItem(&item, None)?;
-            }
-
-            file_op.PerformOperations()?;
-        }
-
-        Ok(())
-    }
-
-    pub fn restore_paths_native(&self, pidls: Vec<Vec<u8>>) -> windows::core::Result<()> {
-        use windows::Win32::System::Com::{CoTaskMemAlloc, CoTaskMemFree};
-
-        unsafe {
-            for pidl_bytes in pidls {
-                let pidl = CoTaskMemAlloc(pidl_bytes.len()) as *mut u8;
-                if pidl.is_null() {
-                    return Err(Error::from(HRESULT(0x80004005u32 as i32)));
-                }
-
-                let result = (|| -> windows::core::Result<()> {
-                    std::ptr::copy_nonoverlapping(pidl_bytes.as_ptr(), pidl, pidl_bytes.len());
-
-                    let shell_item: IShellItem = SHCreateItemFromIDList(pidl as *const ITEMIDLIST)?;
-                    let context_menu: IContextMenu =
-                        shell_item.BindToHandler(None, &BHID_SFUIObject)?;
-
-                    let restore_verb = PCSTR(b"undelete\0".as_ptr());
-                    let info = CMINVOKECOMMANDINFOEX {
-                        cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-                        fMask: 0,
-                        hwnd: HWND(std::ptr::null_mut()),
-                        lpVerb: restore_verb,
-                        lpVerbW: PCWSTR::null(),
-                        nShow: SW_SHOWNORMAL.0,
-                        ..Default::default()
-                    };
-
-                    context_menu.InvokeCommand(&info as *const _ as *const CMINVOKECOMMANDINFO)
-                })();
-
-                CoTaskMemFree(Some(pidl as _));
-                result?;
-            }
-        }
-
         Ok(())
     }
 
@@ -1268,10 +1142,21 @@ impl MainWindow {
                     self.save_app_settings_to_disk();
 
                     if let Some(hwnd) = self.hwnd {
-                        crate::gui::windows::windowsoverrides::set_window_mode(
-                            hwnd,
-                            &self.settings_window.current_settings.window_size_mode,
-                        );
+                        match &self.settings_window.current_settings.window_size_mode {
+                            WindowSizeMode::Custom { width, height } => {
+                                crate::gui::windows::windowsoverrides::set_window_size_keep_origin(
+                                    hwnd, *width, *height,
+                                );
+
+                                crate::gui::windows::windowsoverrides::clamp_window_to_monitor_work_area(hwnd);
+                            }
+                            WindowSizeMode::FullScreen => {
+                                crate::gui::windows::windowsoverrides::set_window_mode(
+                                    hwnd,
+                                    &self.settings_window.current_settings.window_size_mode,
+                                );
+                            }
+                        }
                     }
                 }
                 SettingsAction::ResetToDefaults => {
@@ -2699,40 +2584,58 @@ pub fn handle_pending_actions(pending_action: Option<ItemViewerAction>, explorer
                 sources,
                 target_dir,
             } => {
-                unsafe {
-                    let file_op: IFileOperation =
-                        CoCreateInstance(&FileOperation, None, CLSCTX_ALL).unwrap();
-
-                    // Optional: show UI + allow TeraCopy hooks
-                    file_op
-                        .SetOperationFlags(
-                            FOF_SIMPLEPROGRESS | FOF_ALLOWUNDO | FOFX_SHOWELEVATIONPROMPT,
-                        )
-                        .ok();
-
-                    // Convert target dir to IShellItem
-                    let target_item: IShellItem = SHCreateItemFromParsingName(
-                        &HSTRING::from(target_dir.to_string_lossy().to_string()),
-                        None,
-                    )
-                    .unwrap();
-
-                    for source in &sources {
-                        let source_item: IShellItem = SHCreateItemFromParsingName(
-                            &HSTRING::from(source.to_string_lossy().to_string()),
-                            None,
-                        )
-                        .unwrap();
-
-                        file_op
-                            .MoveItem(&source_item, &target_item, None, None)
-                            .ok();
+                // The source rows can disappear immediately after a successful move. Clear every
+                // view's drag state before touching the file system so a stale release cannot
+                // enqueue the same paths a second time.
+                {
+                    let tab = explorer.active_tab_mut();
+                    tab.primary_view.drag_state.active = false;
+                    tab.primary_view.drag_state.start_pos = None;
+                    tab.primary_view.drag_state.source_items.clear();
+                    if let Some(split) = tab.split_view.as_mut() {
+                        split.drag_state.active = false;
+                        split.drag_state.start_pos = None;
+                        split.drag_state.source_items.clear();
                     }
-
-                    file_op.PerformOperations().ok();
                 }
 
-                if explorer.move_tagged_paths_to_dir(&sources, &target_dir) {
+                let existing_sources: Vec<PathBuf> = sources
+                    .into_iter()
+                    .filter(|source| source.exists())
+                    .collect();
+                let move_result = unsafe {
+                    (|| -> windows::core::Result<()> {
+                        let file_op: IFileOperation =
+                            CoCreateInstance(&FileOperation, None, CLSCTX_ALL)?;
+
+                        file_op.SetOperationFlags(
+                            FOF_SIMPLEPROGRESS | FOF_ALLOWUNDO | FOFX_SHOWELEVATIONPROMPT,
+                        )?;
+
+                        let target_item: IShellItem = SHCreateItemFromParsingName(
+                            &HSTRING::from(target_dir.to_string_lossy().to_string()),
+                            None,
+                        )?;
+
+                        for source in &existing_sources {
+                            let source_item: IShellItem = SHCreateItemFromParsingName(
+                                &HSTRING::from(source.to_string_lossy().to_string()),
+                                None,
+                            )?;
+
+                            file_op.MoveItem(&source_item, &target_item, None, None)?;
+                        }
+
+                        file_op.PerformOperations()?;
+                        Ok(())
+                    })()
+                };
+
+                if existing_sources.is_empty() {
+                    eprintln!("Skipping move: all dragged sources have already disappeared");
+                } else if let Err(error) = move_result {
+                    eprintln!("Failed to move dragged items: {error}");
+                } else if explorer.move_tagged_paths_to_dir(&existing_sources, &target_dir) {
                     explorer.persist_tags();
                 }
 
